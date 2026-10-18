@@ -8,6 +8,14 @@ DOC_NAMES = {"readme.md", "readme", "readme.txt", "contributing.md",
 
 
 def reading_minutes(tokens: int) -> float:
+    """Estimated reading time, in minutes, for ``tokens`` tokens.
+
+    Uses the single documented rate in
+    ``ghostatlas.data.READ_MIN_PER_1K_TOKENS`` (0.5 minutes per
+    1,000 estimated tokens), rounded to one decimal with a 0.1
+    minute floor for any non-empty file. It is a planning estimate
+    shown next to the token estimate, not a second size metric.
+    """
     if not tokens:
         return 0.0
     return max(0.1, round(tokens / 1000.0 * READ_MIN_PER_1K_TOKENS, 1))
@@ -74,8 +82,13 @@ def dead_zones(data) -> dict:
         p = d.get("path")
         if p and p not in seen:
             seen.add(p)
-            dead_files.append({"path": p, "reason": d.get("reason", ""),
-                               "tokens": d.get("tokens", by_path.get(p, {}).get("tokens", 0))})
+            tokens = d.get("tokens")
+            if not isinstance(tokens, (int, float)):
+                tokens = by_path.get(p, {}).get("tokens", 0)
+            # A present-but-None reason/tokens (upstream payloads do
+            # this) used to crash the HTML renderer via html.escape.
+            dead_files.append({"path": p, "reason": d.get("reason") or "",
+                               "tokens": tokens})
     if not dead_files:
         # Fallback shape: code files nothing imports and that are not
         # entry points, labelled as graph observations only.

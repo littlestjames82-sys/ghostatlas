@@ -28,6 +28,11 @@ _LICENSE_NAMES = {"license", "license.md", "license.txt", "licence",
 
 
 def _read(path) -> str:
+    """Read a file as UTF-8 text, replacing undecodable bytes.
+
+    Returns an empty string when the file cannot be read, so one
+    unreadable file never aborts a whole run.
+    """
     try:
         return Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -95,6 +100,12 @@ def top_symbols(text: str, language: str, limit: int = 8) -> list:
 
 
 def _git(args, root: Path):
+    """Run ``git -C <root> <args>`` and return stdout, or ``None``.
+
+    ``None`` covers git being absent, timing out, or exiting
+    non-zero; callers treat all three as "no git history available"
+    and label the result that way.
+    """
     try:
         r = subprocess.run(["git", "-C", str(root)] + args,
                            capture_output=True, text=True, timeout=30)
@@ -154,9 +165,15 @@ def dependency_surface(root: Path, files) -> list:
     if req:
         for ln in _read(req.abspath).splitlines():
             ln = ln.strip()
-            if ln and not ln.startswith("#"):
+            # Option lines (-r includes, --extra-index-url, ...) and
+            # direct URL/VCS references declare no package name for
+            # this names-only surface; both used to leak in as bogus
+            # "dependencies" ("-r", "--extra-index-url", a raw URL).
+            if ln and not ln.startswith("#") and not ln.startswith("-") \
+                    and "://" not in ln:
                 name = re.split(r"[<>=!~\[; ]", ln, 1)[0].strip()
-                if name:
+                if name and not name.startswith(
+                        ("git+", "hg+", "svn+", "bzr+")):
                     deps.add(name)
     pyproj = by_path.get("pyproject.toml")
     if pyproj:
@@ -179,8 +196,21 @@ def dependency_surface(root: Path, files) -> list:
                 deps.add(s.split("=", 1)[0].strip().strip('"'))
     gomod = by_path.get("go.mod")
     if gomod:
+        in_require_block = False
         for ln in _read(gomod.abspath).splitlines():
             s = ln.strip()
+            if s == "require (":
+                in_require_block = True
+                continue
+            if in_require_block:
+                if s == ")":
+                    in_require_block = False
+                elif s and not s.startswith("//"):
+                    # The common multi-line form: one module per line
+                    # inside require ( ... ). It used to be missed
+                    # entirely; only single-line requires were read.
+                    deps.add(s.split()[0])
+                continue
             if s.startswith("require "):
                 rest = s[len("require "):].strip("() ")
                 if rest:
@@ -188,8 +218,156 @@ def dependency_surface(root: Path, files) -> list:
     return sorted(deps)
 
 
+CODE_LANGUAGES = {
+    "python", "typescript", "javascript", "go", "rust", "java", "csharp",
+    "php", "ruby", "kotlin", "swift", "c", "cpp",
+}
+
+_TEST_DIR_SEGMENTS = {"test", "tests", "__tests__", "spec", "specs"}
+
+
+def _stem_of(path: str) -> str:
+    name = PurePosixPath(path).name
+    return name.rsplit(".", 1)[0] if "." in name else name
+
+
+def _test_target_stem(path: str) -> str | None:
+    """The source stem a test file's name points at, by convention:
+    ``test_engine.py`` / ``engine_test.py`` / ``engine.test.ts`` /
+    ``engine.spec.ts`` all point at stem ``engine``. None when the
+    file name carries no such convention."""
+    name = PurePosixPath(path).name
+    for marker in (".test.", ".spec."):
+        if marker in name:
+            return name.split(marker, 1)[0] or None
+    stem = _stem_of(path)
+    if stem.startswith("test_"):
+        return stem[len("test_"):] or None
+    if stem.endswith("_test"):
+        return stem[: -len("_test")] or None
+    return None
+
+
+def test_linkage(files, graph) -> dict:
+    """Static test linkage ("covering shape") for every code source
+    file. Facts only, from the same run's import graph and file
+    names; tests are never executed, so this is NOT measured
+    coverage and surfaces must label it as such.
+
+    A source file is:
+
+    - ``direct``: a test file imports it (an edge in ``graph``), or
+      a test file's name follows the test naming convention for it;
+    - ``indirect``: reachable from a directly linked file through
+      the import graph (shortest path, cycle-safe);
+    - ``unlinked``: neither of the above.
+
+    Test files, generated files, vendored files, and non-code files
+    (docs, config, data) are never counted as sources.
+    """
+    sources = [f for f in files
+               if not f.get("is_test") and not f.get("is_vendored")
+               and not f.get("is_generated")
+               and f.get("language") in CODE_LANGUAGES]
+    source_paths = {f["path"] for f in sources}
+    test_files = sorted(f["path"] for f in files if f.get("is_test"))
+
+    direct_tests: dict[str, list] = defaultdict(list)
+    for test_path in test_files:
+        for dst in (graph.get(test_path) or {}).get("imports", []):
+            if dst in source_paths:
+                direct_tests[dst].append(test_path)
+    by_stem: dict[str, list] = defaultdict(list)
+    for f in sources:
+        by_stem[_stem_of(f["path"])].append(f["path"])
+    for test_path in test_files:
+        stem = _test_target_stem(test_path)
+        if not stem:
+            continue
+        matches = by_stem.get(stem, [])
+        chosen = []
+        if len(matches) == 1:
+            chosen = matches
+        elif len(matches) > 1:
+            parent = PurePosixPath(test_path).parent
+            mirror = PurePosixPath(
+                *[p for p in parent.parts if p not in _TEST_DIR_SEGMENTS])
+            chosen = [m for m in matches
+                      if PurePosixPath(m).parent in (parent, mirror)]
+        for m in chosen:
+            if test_path not in direct_tests[m]:
+                direct_tests[m].append(test_path)
+
+    # Indirect: breadth-first from the directly linked files over the
+    # import graph, sources only, shortest distance first.
+    indirect: dict[str, dict] = {}
+    queue = sorted(direct_tests)
+    seen = set(queue)
+    frontier = [(p, p, 0) for p in queue]  # (node, direct root, dist)
+    while frontier:
+        nxt = []
+        for node, root, dist in frontier:
+            for dst in sorted((graph.get(node) or {}).get("imports", [])):
+                if dst in source_paths and dst not in seen:
+                    seen.add(dst)
+                    indirect[dst] = {"via": node, "direct_source": root,
+                                     "distance": dist + 1}
+                    nxt.append((dst, root, dist + 1))
+        frontier = nxt
+
+    rank = {"direct": 0, "indirect": 1, "unlinked": 2}
+    out = []
+    for f in sources:
+        path = f["path"]
+        if path in direct_tests:
+            status, extra = "direct", {"test_files": sorted(direct_tests[path]),
+                                       "via": None, "direct_source": None,
+                                       "distance": 0}
+        elif path in indirect:
+            status = "indirect"
+            extra = {"test_files": [], "via": indirect[path]["via"],
+                     "direct_source": indirect[path]["direct_source"],
+                     "distance": indirect[path]["distance"]}
+        else:
+            status, extra = "unlinked", {"test_files": [], "via": None,
+                                         "direct_source": None, "distance": 0}
+        out.append({"path": path, "status": status,
+                    "tokens": f.get("tokens", 0),
+                    "importer_count": f.get("importer_count", 0), **extra})
+    out.sort(key=lambda s: (rank[s["status"]], -s["importer_count"],
+                            -s["tokens"], s["path"]))
+    summary = {
+        "source_files": len(out),
+        "direct": sum(1 for s in out if s["status"] == "direct"),
+        "indirect": sum(1 for s in out if s["status"] == "indirect"),
+        "unlinked": sum(1 for s in out if s["status"] == "unlinked"),
+        "test_files": len(test_files),
+    }
+    return {"summary": summary, "sources": out, "test_files": test_files,
+            "method": ("static linkage only: direct means a test file "
+                       "imports the source or follows its test naming "
+                       "convention; indirect means reachable from a "
+                       "directly linked file through the import graph; "
+                       "tests were not executed, so this is not "
+                       "measured coverage")}
+
+
 @dataclass
 class AtlasData:
+    """Everything one Atlas run knows about a project.
+
+    A single instance feeds every surface (HTML map, ``ATLAS.md``
+    brief, JSON), so numbers can never disagree between artifacts.
+    File entries are plain dicts in scan order; each is enriched
+    during assembly with ``doc`` (extracted docstring first line, or
+    ``""``), ``symbols``, ``importer_count``, and ``package``.
+
+    ``engine`` is ``"ghostslice"`` when GhostSlice produced the
+    scan/graph numbers, or ``"fallback"`` when the labelled fallback
+    engine in :mod:`ghostatlas.engine` did. Token counts are
+    GhostSlice estimator *estimates*, never exact tokenizer counts.
+    """
+
     root: str
     title: str
     run_stamp: str
@@ -211,13 +389,21 @@ class AtlasData:
     lint_findings: list = field(default_factory=list)
     dependencies: list = field(default_factory=list)
     licenses: list = field(default_factory=list)
+    test_coverage: dict = field(default_factory=dict)  # static linkage, see test_linkage
     total_tokens: int = 0
     total_size: int = 0
 
     def by_path(self):
+        """Return the file dicts indexed by their project-relative path."""
         return {f["path"]: f for f in self.files}
 
     def to_dict(self):
+        """Return a JSON-serialisable view of the run.
+
+        This is what ``ghostatlas scan`` prints, what ``--json-out``
+        writes, and what the HTML map embeds. Internal-only fields
+        (per-file importers, call counts, config) are not included.
+        """
         return {
             "root": self.root, "title": self.title,
             "run_stamp": self.run_stamp, "engine": self.engine,
@@ -230,6 +416,7 @@ class AtlasData:
             "secrets_summary": self.secrets_summary,
             "lint_findings": self.lint_findings,
             "dependencies": self.dependencies, "licenses": self.licenses,
+            "test_coverage": self.test_coverage,
             "total_tokens": self.total_tokens, "total_size": self.total_size,
         }
 
@@ -278,9 +465,29 @@ def _sample_call_chains(gs, scan_obj, graph) -> tuple[list, dict]:
 
 
 def build_atlas_data(root: str | Path, audience: str = "onboarding") -> AtlasData:
+    """Assemble the :class:`AtlasData` for the project at ``root``.
+
+    Steps: load and validate the project's atlas config, scan and
+    graph the project (via GhostSlice when importable, otherwise
+    the labelled fallback engine), drop any config-hidden paths
+    from every surface, then enrich each file with its extracted
+    docstring first line, top symbols, and importer count.
+
+    Args:
+        root: Path to the project directory. Read only; the project
+            is never modified.
+        audience: ``"onboarding"`` (default) or ``"diligence"``.
+            Recorded on the result; it changes brief ordering, not
+            the underlying data.
+
+    Raises:
+        ValueError: If ``root`` is not a directory, or if the
+            project's ``.ghostslice.json`` atlas section is malformed
+            or contains an unknown key. The CLI maps this to exit 2.
+    """
     root = Path(root).resolve()
     if not root.is_dir():
-        raise ValueError(f"ghostatlas: not a directory: {root}")
+        raise ValueError(f"not a directory: {root}")
     cfg = load_atlas_config(root)
     gs = engine.load_ghostslice()
     eng = "ghostslice" if gs is not None else "fallback"
@@ -291,6 +498,7 @@ def build_atlas_data(root: str | Path, audience: str = "onboarding") -> AtlasDat
     graph: dict = {}
     entries: list = []
     duplicates: dict = {"exact": [], "near": []}
+    secret_findings: list = []
     secrets_summary: dict = {"count": 0, "by_type": {}, "by_file": {}}
     lint_findings: list = []
     call_chains: list = []
@@ -321,6 +529,7 @@ def build_atlas_data(root: str | Path, audience: str = "onboarding") -> AtlasDat
         try:
             from ghostslice.secrets_scan import scan_scan_result
             findings = scan_scan_result(scan_obj)
+            secret_findings = findings
             by_type = Counter(x.get("type", "unknown") for x in findings)
             by_file = Counter(x.get("path", "") for x in findings)
             secrets_summary = {"count": len(findings),
@@ -351,6 +560,7 @@ def build_atlas_data(root: str | Path, audience: str = "onboarding") -> AtlasDat
         entries = engine.fallback_entries(scan_obj, graph)
 
     # hidden paths from the atlas config are removed from every surface
+    removed: set = set()
     if cfg["hidden_paths"]:
         keep = [f for f in files if not is_hidden(f["path"], cfg["hidden_paths"])]
         removed = {f["path"] for f in files} - {f["path"] for f in keep}
@@ -360,6 +570,69 @@ def build_atlas_data(root: str | Path, audience: str = "onboarding") -> AtlasDat
                  for k, v in graph.items() if k not in removed}
         entries = [e for e in entries if e["path"] not in removed]
         dead = [d for d in dead if d.get("path") not in removed]
+        # The surfaces below used to leak hidden paths (and, for
+        # packages, stale pre-filter counts that disagreed with the
+        # filtered totals - a consistency-bar violation):
+        def _visible(group):
+            g = dict(group)
+            g["files"] = [p for p in group.get("files", []) if p not in removed]
+            return g
+
+        exact = []
+        for group in duplicates.get("exact", []) or []:
+            g = _visible(group)
+            if len(g["files"]) >= 2:
+                if "tokens_each" in g and "potential_savings" in g:
+                    g["potential_savings"] = g["tokens_each"] * (len(g["files"]) - 1)
+                exact.append(g)
+        near = []
+        for pair in duplicates.get("near", []) or []:
+            pair_files = pair.get("files") or [pair.get("a"), pair.get("b")]
+            if pair_files and all(p not in removed for p in pair_files if p):
+                near.append(pair)
+        duplicates = {"exact": exact, "near": near}
+        lint_findings = [f for f in lint_findings
+                         if f.get("path") not in removed
+                         and not any(rp in json.dumps(f, default=str)
+                                     for rp in removed)]
+        # A dead candidate's reason text can likewise name a hidden
+        # file (e.g. "duplicate of <hidden path>").
+        dead = [d for d in dead
+                if not any(rp in (d.get("reason") or "") for rp in removed)]
+        if secret_findings:
+            kept_findings = [x for x in secret_findings
+                             if x.get("path", "") not in removed]
+            by_type = Counter(x.get("type", "unknown") for x in kept_findings)
+            by_file = Counter(x.get("path", "") for x in kept_findings)
+            secrets_summary = {"count": len(kept_findings),
+                               "by_type": dict(sorted(by_type.items())),
+                               "by_file": dict(sorted(by_file.items()))}
+        call_chains = [
+            c for c in call_chains
+            if not any(s.rsplit(":", 1)[0] in removed
+                       for s in c.get("symbols", []))]
+        if packages:
+            agg: dict = {}
+            for f in files:
+                key = f.get("package") or (
+                    f["path"].rsplit("/", 1)[0] if "/" in f["path"] else "")
+                a = agg.setdefault(key, {"files": 0, "tokens": 0})
+                a["files"] += 1
+                a["tokens"] += f.get("tokens", 0)
+            pkg_total = sum(a["tokens"] for a in agg.values())
+            new_packages = []
+            for p in packages:
+                a = agg.get(p.get("path"))
+                if not a:
+                    continue
+                p2 = dict(p)
+                p2["files"] = a["files"]
+                p2["tokens"] = a["tokens"]
+                if "share" in p2:
+                    p2["share"] = (round(100.0 * a["tokens"] / pkg_total, 2)
+                                   if pkg_total else 0.0)
+                new_packages.append(p2)
+            packages = new_packages
 
     # per-file enrichment: docstring first line, top symbols, importers
     importers: dict[str, list] = defaultdict(list)
@@ -379,6 +652,10 @@ def build_atlas_data(root: str | Path, audience: str = "onboarding") -> AtlasDat
         f["importer_count"] = len(importers.get(f["path"], []))
         f["package"] = f.get("package") or (
             f["path"].rsplit("/", 1)[0] if "/" in f["path"] else "")
+
+    # Static test linkage over the (hidden-path filtered) graph and
+    # file set, so hidden files never appear here either.
+    test_cov = test_linkage(files, graph)
 
     if not packages:
         agg: dict[str, dict] = {}
@@ -418,7 +695,13 @@ def build_atlas_data(root: str | Path, audience: str = "onboarding") -> AtlasDat
         lint_findings=lint_findings,
         dependencies=dependency_surface(root, file_objs),
         licenses=licenses,
+        test_coverage=test_cov,
         total_tokens=sum(f.get("tokens", 0) for f in files),
         total_size=sum(f.get("size", 0) for f in files),
     )
+    if removed:
+        per_file = data.git.get("per_file") or {}
+        data.git = {**data.git, "per_file": {
+            k: v for k, v in per_file.items()
+            if k not in removed and not is_hidden(k, cfg["hidden_paths"])}}
     return data

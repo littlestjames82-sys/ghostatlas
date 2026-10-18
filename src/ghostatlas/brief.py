@@ -16,6 +16,15 @@ from .reading import dead_zones, reading_minutes, reading_order
 
 
 def checked_box_lines(data) -> list:
+    """Return the "checked / not checked" lines for a run.
+
+    Shared by the Markdown brief and the HTML map so both artifacts
+    state the same limits. The list is factual about this run: it
+    notes when git history was unavailable, when the fallback engine
+    produced the numbers, and when no Python call graph was
+    available. It never claims a security audit; that is
+    GhostExposure's scope.
+    """
     git_txt = ("git history (span and per-file activity, window: "
                + data.git.get("window", "") + ")" if data.git.get("available")
                else "git history (not available: no local git log)")
@@ -25,6 +34,7 @@ def checked_box_lines(data) -> list:
         "Checked: entry-point candidates with per-file evidence.",
         f"Checked: {git_txt}.",
         "Checked: exact/near duplicate clusters.",
+        "Checked: static test linkage (test imports and test naming conventions; tests themselves were not executed, so this is not measured coverage).",
         "Not checked: runtime behaviour, test execution, or profiling data (static analysis only).",
         "Not checked: security audit or vulnerability assessment (see GhostExposure for audit preparation).",
         "Not checked: any external service, registry, or network source.",
@@ -122,6 +132,45 @@ def _test_lines(data) -> list:
         lines.append(f"- `{f['path']}` ({f.get('tokens', 0)} estimated tokens)")
     if not tests:
         lines.append("- No test files were detected by the scanner's test-file rules.")
+    cov = getattr(data, "test_coverage", None) or {}
+    sources = cov.get("sources") or []
+    if sources:
+        s = cov.get("summary", {})
+        lines += ["", "Covering shape (static test linkage, not measured "
+                  "coverage): tests were not executed. Directly linked "
+                  "means a test file imports the source file or follows "
+                  "its test naming convention; indirectly linked means "
+                  "reachable from a directly linked file through the "
+                  "import graph.", "",
+                  f"- Source files: {s.get('source_files', len(sources))}: "
+                  f"{s.get('direct', 0)} directly linked, "
+                  f"{s.get('indirect', 0)} indirectly linked, "
+                  f"{s.get('unlinked', 0)} with no test link found."]
+        for src in sources:
+            if src["status"] == "direct":
+                linked = ", ".join(f"`{t}`" for t in src.get("test_files", []))
+                lines.append(f"- `{src['path']}`: directly linked from "
+                             f"test file(s) {linked}.")
+            elif src["status"] == "indirect":
+                via = src.get("via")
+                root = src.get("direct_source")
+                if via and root and via != root:
+                    how = f"via `{root}` through `{via}`"
+                else:
+                    how = f"via `{root or via}`"
+                lines.append(f"- `{src['path']}`: indirectly linked {how} "
+                             "in the import graph.")
+        unlinked = [src for src in sources if src["status"] == "unlinked"]
+        if unlinked:
+            lines.append("")
+            lines.append("Source files with no test link found "
+                         "(observations for a human to judge, in "
+                         "depended-on order):")
+            for src in unlinked:
+                lines.append(
+                    f"- `{src['path']}` ({src.get('tokens', 0)} estimated "
+                    f"tokens, depended on by {src.get('importer_count', 0)} "
+                    "file(s)): no test link found.")
     lines.append("")
     return lines
 
@@ -172,10 +221,20 @@ def _diligence_lines(data) -> list:
     span = ("not available (no local git log)" if not git.get("available")
             else f"{git.get('first_date') or 'unknown'} to {git.get('last_date') or 'unknown'} "
                  f"({git.get('total_commits', 0)} commits in the local log)")
+    cov_summary = (getattr(data, "test_coverage", None) or {}).get("summary")
+    if cov_summary:
+        linkage_txt = (
+            f"{cov_summary.get('direct', 0) + cov_summary.get('indirect', 0)} of "
+            f"{cov_summary.get('source_files', 0)} source file(s) directly or "
+            f"indirectly linked to a test file; {cov_summary.get('unlinked', 0)} "
+            "with no test link found.")
+    else:
+        linkage_txt = "not computed for this run."
     lines = ["## Diligence ordering", "",
              "This Atlas is an orientation aid, not an audit opinion.", "",
              f"- Project size: {len(data.files)} files, {data.total_tokens} estimated tokens, {data.total_size} bytes.",
              f"- Test presence: {sum(1 for f in data.files if f.get('is_test'))} test file(s) detected.",
+             f"- Test linkage (static, not measured coverage): {linkage_txt}",
              f"- Secrets guard result (counts and types only, no values): {s.get('count', 0)} finding(s); types: {type_txt}.",
              "- Dependency surface from manifests: " +
              (", ".join(data.dependencies) if data.dependencies else "none declared in the manifests read") + ".",
@@ -200,6 +259,15 @@ def _module_lines(data) -> list:
 
 
 def build_brief(data, top_n: int = 10) -> str:
+    """Render the ``ATLAS.md`` architecture brief for a run.
+
+    Section order depends on ``data.audience``: diligence leads with
+    the diligence summary (size, tests, secrets counts, dependencies,
+    licences, history) and its checked / not-checked box; onboarding
+    leads with layout and the reading order and puts the box last.
+    All sections are extractive and factual (see the module
+    docstring); ``top_n`` caps the reading-order length.
+    """
     title = data.title
     head = [f"# Atlas: {title}", "",
             f"Generated {data.generated_at} by GhostAtlas {__import__('ghostatlas').__version__} "

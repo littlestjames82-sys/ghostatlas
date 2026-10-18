@@ -92,6 +92,13 @@ def _layout(data):
 
 
 def _svg(data, nodes, width, height):
+    """Render the module map as inline SVG.
+
+    Draws a package heading per column, one line per import-graph
+    edge, and one circle per file (sized by the layout, coloured by
+    the page's heat toggle). All project strings are HTML-escaped;
+    a circle's ``<title>`` carries its path and estimated tokens.
+    """
     idx = {f["path"]: i for i, f in enumerate(data.files)}
     parts = [f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="module map">']
     seen_pkg = set()
@@ -124,6 +131,15 @@ def _svg(data, nodes, width, height):
 
 
 def build_html(data, top_n: int = 10) -> str:
+    """Render the complete, self-contained ``atlas.html`` document.
+
+    The returned string is the whole artifact: inline CSS, inline
+    SVG map, reading-order and package tables, dead zones, the
+    checked / not-checked box, and the run data embedded as JSON
+    for the local heat toggles. It references no external asset and
+    makes no network request when opened. ``top_n`` caps the
+    reading-order table, matching the brief from the same run.
+    """
     order = reading_order(data, top_n)
     zones = dead_zones(data)
     nodes, width, height = _layout(data)
@@ -151,6 +167,41 @@ def build_html(data, top_n: int = 10) -> str:
     dead_rows = "".join(
         f"<li><code>{html.escape(d['path'])}</code>: {html.escape(d.get('reason', ''))}</li>"
         for d in zones["dead_files"][:20]) or "<li>None found by static analysis.</li>"
+    cov = getattr(data, "test_coverage", None) or {}
+    cov_sources = cov.get("sources") or []
+    if cov_sources:
+        cov_summary = cov.get("summary", {})
+
+        def _linked_from(src):
+            if src["status"] == "direct":
+                return ", ".join(html.escape(t) for t in src.get("test_files", []))
+            if src["status"] == "indirect":
+                root = src.get("direct_source") or src.get("via") or ""
+                return f"via {html.escape(root)} (import graph)"
+            return "no test link found"
+
+        cov_rows = "".join(
+            f"<tr><td><code>{html.escape(src['path'])}</code></td>"
+            f"<td>{html.escape(src['status'])}</td>"
+            f"<td>{_linked_from(src)}</td></tr>"
+            for src in cov_sources)
+        test_section = (
+            "<h2>Test layout</h2>"
+            "<p>Static test linkage only: tests were not executed, so this "
+            "is not measured coverage. Directly linked means a test file "
+            "imports the source file or follows its test naming "
+            "convention; indirectly linked means reachable from a "
+            "directly linked file through the import graph.</p>"
+            f"<p>Source files: {cov_summary.get('source_files', len(cov_sources))}: "
+            f"{cov_summary.get('direct', 0)} directly linked, "
+            f"{cov_summary.get('indirect', 0)} indirectly linked, "
+            f"{cov_summary.get('unlinked', 0)} with no test link found.</p>"
+            "<table><tr><th>Source file</th><th>Test linkage</th>"
+            f"<th>Linked from</th></tr>{cov_rows}</table>")
+    else:
+        test_section = (
+            "<h2>Test layout</h2>"
+            "<p>No code source files were found for static test linkage.</p>")
     checked = "".join(f"<li>{html.escape(ln)}</li>" for ln in checked_box_lines(data))
 
     return f"""<!DOCTYPE html>
@@ -171,6 +222,7 @@ def build_html(data, top_n: int = 10) -> str:
 <table><tr><th>#</th><th>File</th><th>Why (factual reason)</th><th>Est. tokens</th><th>Est. minutes</th></tr>{order_rows}</table>
 <h2>Packages</h2>
 <table><tr><th>Package</th><th>Files</th><th>Est. tokens</th></tr>{pkg_rows}</table>
+{test_section}
 <h2>Dead zones: worth asking about</h2>
 <p>Observations from static analysis for a human to judge, not delete instructions.</p>
 <ul>{dead_rows}</ul>

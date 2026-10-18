@@ -51,12 +51,18 @@ def load_atlas_config(root: str | Path) -> dict:
         if key == "title":
             if not isinstance(val, str) or not val.strip():
                 raise ValueError(f"{candidate}: atlas 'title' must be a non-empty string")
-            cfg["title"] = val.strip()
+            # One line only: a title/note is rendered into the brief
+            # heading/body, so embedded newlines could inject fake
+            # brief lines (e.g. a forged token total).
+            cfg["title"] = " ".join(val.split())
         else:
             if not isinstance(val, list) or any(not isinstance(v, str) for v in val):
                 raise ValueError(
                     f"{candidate}: atlas {key!r} must be a list of strings")
-            cfg[key] = list(val)
+            if key == "audience_notes":
+                cfg[key] = [" ".join(v.split()) for v in val]
+            else:
+                cfg[key] = list(val)
     return cfg
 
 
